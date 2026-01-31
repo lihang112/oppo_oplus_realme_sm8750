@@ -1,0 +1,172 @@
+name: 加速版构建 6.6.89 欧加真OKI内核 (含自定义驱动测试)
+
+env:
+  TZ: Asia/Shanghai
+  ANDROID_VERSION: 'android15'
+  KERNEL_VERSION: '6.6'
+  KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_type:
+        description: 'KernelSU分支(SukiSU Ultra/ReSukiSU/KernelSU Next/MKSU/KSU(原版)/无内置KSU,默认SukiSU Ultra)'
+        required: true
+        type: choice
+        default: 'sukisu'
+        options:
+          - 'sukisu'
+          - 'resukisu'
+          - 'ksunext'
+          - 'mksu'
+          - 'ksu'
+          - 'none'
+      susfs_enable:
+        description: '是否开启susfs'
+        required: true
+        type: boolean
+        default: 'true'
+      kpm_enable:
+        description: '是否开启kpm'
+        required: true
+        type: choice
+        default: 'false'
+        options:
+          - 'false'
+          - 'builtin'
+          - 'kpn'
+      lz4_enable:
+        description: '是否开启lz4kd补丁'
+        required: true
+        type: boolean
+        default: 'true'
+      bbr_enable:
+        description: '是否开启BBR/CUBIC/FQ_PIE'
+        required: true
+        type: boolean
+        default: 'true'
+      better_net:
+        description: '是否开启更多网络增强支持'
+        required: true
+        type: boolean
+        default: 'false'
+      adios_enable:
+        description: '是否开启ADIOS调度器'
+        required: true
+        type: boolean
+        default: 'false'
+      baseband_guard:
+        description: '是否开启基带格机保护'
+        required: true
+        type: boolean
+        default: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    outputs:
+      ksuver: ${{ steps.ksu_version.outputs.version }}
+    
+    steps:
+      - name: 检查环境
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc build-essential flex bison lz4 libssl-dev libelf-dev clang libfaketime ccache wget curl git
+
+      - name: 拉取内核源码
+        run: |
+          git clone --depth=1 https://github.com/oneplus-oss/android_kernel_oneplus_sm8750.git -b oneplus/sm8750_v_15.0.0_oneplus13 kernel_workspace
+          cd kernel_workspace
+          git clone --depth=1 https://github.com/oneplus-oss/android_kernel_oneplus_sm8750_drivers.git -b oneplus/sm8750_v_15.0.0_oneplus13 drivers
+
+      ### >>>>>> 驱动注入逻辑开始 <<<<<< ###
+      - name: 注入测试驱动 (my_test_dev)
+        run: |
+          cd kernel_workspace/common/drivers/char/
+          
+          # 1. 动态生成驱动源码
+          cat <<EOF > my_test_driver.c
+          #include <linux/module.h>
+          #include <linux/miscdevice.h>
+          #include <linux/fs.h>
+          #include <linux/uaccess.h>
+
+          #define MY_MAGIC 'm'
+          #define MY_HELLO _IO(MY_MAGIC, 1)
+
+          static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+              if (cmd == MY_HELLO) {
+                  printk(KERN_INFO "[MyDriver] Success: App called IOCTL!\n");
+                  return 0;
+              }
+              return -EINVAL;
+          }
+
+          static const struct file_operations my_fops = {
+              .owner = THIS_MODULE,
+              .unlocked_ioctl = my_ioctl,
+          };
+
+          static struct miscdevice my_misc = {
+              .minor = MISC_DYNAMIC_MINOR,
+              .name = "my_test_dev",
+              .fops = &my_fops,
+          };
+
+          static int __init my_init(void) {
+              printk(KERN_INFO "[MyDriver] Loaded. Node: /dev/my_test_dev\n");
+              return misc_register(&my_misc);
+          }
+
+          static void __exit my_exit(void) {
+              misc_deregister(&my_misc);
+              printk(KERN_INFO "[MyDriver] Unloaded.\n");
+          }
+
+          module_init(my_init);
+          module_exit(my_exit);
+          MODULE_LICENSE("GPL");
+          EOF
+
+          # 2. 修改 Makefile 启用编译
+          echo "obj-y += my_test_driver.o" >> Makefile
+          
+          # 3. 在配置文件中开启
+          cd ../../
+          echo "CONFIG_MY_TEST_DRIVER=y" >> ./arch/arm64/configs/gki_defconfig
+          echo "驱动注入完成！"
+      ### >>>>>> 驱动注入逻辑结束 <<<<<< ###
+
+      - name: 设置工具链
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/clang
+          cd $GITHUB_WORKSPACE/clang
+          wget https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz
+          tar -xf clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz --strip-components=1
+
+      - name: 开始编译内核
+        run: |
+          cd kernel_workspace
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          make -j$(nproc) O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 gki_defconfig
+          make -j$(nproc) O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 Image.lz4
+
+      - name: 检查产物并打包
+        run: |
+          if [ -f kernel_workspace/out/arch/arm64/boot/Image ]; then
+            echo "编译成功"
+            # 接下来执行你的 AnyKernel3 打包逻辑
+          else
+            echo "编译失败"
+            exit 1
+          fi
+
+      - name: 上传构建结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel_SM8750_With_MyDriver
+          path: kernel_workspace/out/arch/arm64/boot/Image
