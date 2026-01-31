@@ -109,9 +109,17 @@ jobs:
                CROSS_COMPILE=aarch64-linux-gnu- \
                Image
 
-      - name: 打包产物并上传
+      - name: 自动打包为 AnyKernel3 刷入包
+        if: success()
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git
+          cp kernel_workspace/common/arch/arm64/boot/Image AnyKernel3/
+          cd AnyKernel3
+          zip -r9 ../Oneplus13-Kernel-Flashable.zip *
+
+      - name: 上传刷入包
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel_Image_with_my_comm
-          path: kernel_workspace/common/out/arch/arm64/boot/Image
+          name: Oneplus13-Kernel-Custom-Driver
+          path: Oneplus13-Kernel-Flashable.zip
