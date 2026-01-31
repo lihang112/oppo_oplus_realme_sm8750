@@ -1,86 +1,117 @@
-name: 清理仓库工作流
+name: 加速版构建 6.6.89 欧加真OKI内核-自定义驱动版
+
+env:
+  TZ: Asia/Shanghai
+  ANDROID_VERSION: 'android15'
+  KERNEL_VERSION: '6.6'
+  KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
 
 on:
   workflow_dispatch:
     inputs:
-      clean_mode:
-        description: "清理模式(amount--保留数量, date--保留天数)："
+      ksu_type:
+        description: 'KernelSU分支(sukisu/ksunext等)'
         required: true
         type: choice
-        default: 'amount'
-        options:
-          - 'amount'
-          - 'date'
-      clean_to_keep:
-        description: "保留最近工作流的天数/数量："
+        default: 'sukisu'
+        options: [ 'sukisu', 'resukisu', 'ksunext', 'mksu', 'ksu', 'none' ]
+      susfs_enable:
+        description: '是否开启susfs'
         required: true
-        type: string
-        default: "0"
+        type: boolean
+        default: true
+      adios_enable:
+        description: '是否启用ADIOS IO调度器'
+        required: true
+        type: boolean
+        default: true
+      baseband_guard:
+        description: '是否开启内核级基带保护'
+        required: true
+        type: boolean
+        default: true
 
 jobs:
-  clean-workflows:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-
     steps:
-      - name: 检出当前仓库
-        uses: actions/checkout@v4
+      - name: 安装环境依赖+初始化源码仓库及工具链
+        run: |
+          rm -rf kernel_workspace && mkdir kernel_workspace && cd kernel_workspace
+          sudo apt update && sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev ccache aria2 zip unzip
+          
+          echo "正在克隆源码..."
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89.zip -o common.zip
+          unzip -q common.zip && mv "android_kernel_common_oneplus_sm8750-oneplus-sm8750_v_16.0.0_oneplus_13_6.6.89" common && rm common.zip
+          
+          echo "正在克隆llvm-clang18工具链..."
+          mkdir -p clang18 && aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip -o clang.zip
+          unzip -q clang.zip -d clang18 && rm clang.zip
+
+      - name: 注入自定义通信驱动 /dev/my_comm
+        run: |
+          cd kernel_workspace/common
+          # 创建驱动源文件
+          cat <<EOF > drivers/char/my_comm.c
+          #include <linux/module.h>
+          #include <linux/fs.h>
+          #include <linux/uaccess.h>
+          #include <linux/miscdevice.h>
+
+          static ssize_t my_comm_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) {
+              char msg[] = "Success from my_comm!\n";
+              return simple_read_from_buffer(buf, count, ppos, msg, sizeof(msg));
+          }
+
+          static const struct file_operations my_comm_fops = {
+              .owner = THIS_MODULE,
+              .read = my_comm_read,
+          };
+
+          static struct miscdevice my_comm_misc = {
+              .minor = MISC_DYNAMIC_MINOR,
+              .name = "my_comm",
+              .fops = &my_comm_fops,
+              .mode = 0666, 
+          };
+
+          static int __init my_comm_init(void) { return misc_register(&my_comm_misc); }
+          static void __exit my_comm_exit(void) { misc_deregister(&my_comm_misc); }
+
+          module_init(my_comm_init);
+          module_exit(my_comm_exit);
+          MODULE_LICENSE("GPL");
+          EOF
+
+          # 注册驱动到 Makefile
+          echo "obj-y += my_comm.o" >> drivers/char/Makefile
+
+      - name: 配置并载入 ccache 缓存
+        uses: actions/cache@v4
         with:
-          fetch-depth: 0
-          
-      - name: 安装GitHub CLI
-        run: |
-          sudo apt-mark hold firefox
-          sudo apt-mark hold libc-bin
-          sudo apt purge man-db
-          sudo apt update
-          sudo apt install -y jq
-          type -p gh >/dev/null || sudo apt install -y gh
-          gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
-          gh --version
+          path: ~/.ccache_6.6.89
+          key: ccache-kernel-6.6.89-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-kernel-6.6.89-${{ runner.os }}-
 
-      - name: 按保留数量清理工作流
-        if: ${{ github.event.inputs.clean_mode == 'amount' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 执行内核编译
         run: |
-          repo_full_name=$GITHUB_REPOSITORY
-          # 获取所有工作流（按创建时间倒序）
-          all_workflows=$(gh api -X GET "repos/$repo_full_name/actions/runs?per_page=100" | 
-            jq --arg current_run "$GITHUB_RUN_ID" '.workflow_runs | map(select(.id != ($current_run | tonumber)))')
-          # 计算实际需要保留的工作流数量
-          total_workflows=$(echo "$all_workflows" | jq length)
-          keep_count=$(( ${{ github.event.inputs.clean_to_keep }} < total_workflows ? ${{ github.event.inputs.clean_to_keep }} : total_workflows ))
-          # 获取要保留的最新工作流ID
-          keep_ids=$(echo "$all_workflows" | 
-            jq -r 'sort_by(.created_at) | reverse | .[0:'$keep_count'] | .[].id')
-          echo "保留最近 $keep_count 个工作流 (ID: $keep_ids)"
-          # 删除不在保留列表中的工作流
-          echo "$all_workflows" | jq -r '.[] | select(.status != "in_progress" and .status != "queued") | .id' | while read id; do
-            if ! grep -qw "$id" <<< "$keep_ids"; then
-              echo "删除工作流 $id"
-              gh api -X DELETE "repos/$repo_full_name/actions/runs/$id" --silent
-            fi
-          done
-
-
-      - name: 按保留天数清理工作流
-        if: ${{ github.event.inputs.clean_mode == 'date'}}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          repo_full_name=$GITHUB_REPOSITORY
-          cutoff_date=$(date -d "${{ github.event.inputs.clean_to_keep }} days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
-          echo "删除 $cutoff_date 之前的所有工作流..."
+          cd kernel_workspace/common
+          export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang18/bin:$PATH
+          export USE_CCACHE=1
+          export CCACHE_DIR=~/.ccache_6.6.89
           
-          # 获取需要删除的工作流ID
-          to_delete_ids=$(gh api -X GET "repos/$repo_full_name/actions/runs?created=<$cutoff_date&per_page=100" | 
-            jq -r --arg current_run "$GITHUB_RUN_ID" '.workflow_runs[] | 
-            select(.id != ($current_run | tonumber) and .status != "in_progress" and .status != "queued") | .id')
-          
-          for id in $to_delete_ids; do
-            echo "删除工作流 $id (创建于 $cutoff_date 之前)"
-            gh api -X DELETE "repos/$repo_full_name/actions/runs/$id" --silent
-          done
+          # 核心编译指令
+          make LLVM=1 ARCH=arm64 gki_defconfig
+          make -j$(nproc --all) \
+               LLVM=1 \
+               ARCH=arm64 \
+               CLANG_TRIPLE=aarch64-linux-gnu- \
+               CROSS_COMPILE=aarch64-linux-gnu- \
+               Image
+
+      - name: 打包产物并上传
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel_Image_with_my_comm
+          path: kernel_workspace/common/out/arch/arm64/boot/Image
